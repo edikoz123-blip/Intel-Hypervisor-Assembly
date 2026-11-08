@@ -71,18 +71,22 @@ boot_middle:
     rep stosd
 
 setup_identity_paging:
-    ; 1. Map the root architectural layers (PML4 -> PDPT -> PD)
+    ; -------------------------------------------------------------------------
+    ; 1. Map the root architectural layers for Base Memory (PML4 -> PDPT -> PD)
     ; Attributes: Present (Bit 0) + Read/Write (Bit 1) = 0x03
+    ; -------------------------------------------------------------------------
     mov dword [0x1000], 0x00002003      ; PML4 (0x1000) points to PDPT at 0x2000
     mov dword [0x1004], 0x00000000     
     
-    mov dword [0x2000], 0x00003003      ; PDPT (0x2000) points to PD at 0x3000
+    mov dword [0x2000], 0x00003003      ; PDPT (0x2000) entry 0 points to PD at 0x3000 (0-1GB)
     mov dword [0x2004], 0x00000000
     
-    mov dword [0x3000], 0x00004003      ; PD (0x3000) points to Page Table Array at 0x4000
+    mov dword [0x3000], 0x00004003      ; PD (0x3000) entry 0 points to Page Table Array at 0x4000
     mov dword [0x3004], 0x00000000
 
+    ; -------------------------------------------------------------------------
     ; 2. Execute loop mapping cycle for continuous 4KB frames inside Page Table
+    ; -------------------------------------------------------------------------
     mov edx, 0x4000                     ; EDX = Write pointer inside Page Table Array
     mov eax, 0x00000003                 ; EAX = Physical RAM base address (0x0 + flags)
     mov ecx, 50                         ; Map exactly 50 continuous pages (80KB isolation block)
@@ -96,6 +100,33 @@ loop_Start_Mapping:
     
     dec ecx                             
     jnz loop_Start_Mapping             
+
+    ; -------------------------------------------------------------------------
+    ; 3. Dedicated 4KB Page Table Array for the IOMMU range (Sterile & Continuous)
+    ; -------------------------------------------------------------------------
+    ; Connect PDPT entry 3 (3GB-4GB range) to a clean, new Page Directory at 0x6000
+    mov dword [0x2018], 0x00006003      ; PDPT Entry 3 points to new PD at 0x6000
+    mov dword [0x201C], 0x00000000
+
+    ; Connect PD entry 502 to our clean Page Table at 0x5000
+    ; 0xFED00000 / 2MB = 2038. Inside this PD, 2038 - 1536 = Entry 502
+    mov dword [0x6000 + (502 * 8)], 0x00005003 
+    mov dword [0x6004 + (502 * 8)], 0x00000000
+
+    ; Now, populate the PT at 0x5000 to map a continuous block of 4KB pages
+    ; Starting from the exact physical base of the IOMMU range
+    mov edx, 0x5000                     ; Point to the base of our Page Table
+    mov eax, 0xFED00013                 ; Base Physical Address (with Present + R/W + PCD flags)
+    mov ecx, 512                        ; Map the entire 2MB block in 4KB frames to be fully safe
+
+.loop_vtd_pt_mapping:
+    mov dword [edx], eax                ; Write lower 32 bits
+    mov dword [edx + 4], 0              ; Clear upper 32 bits (Disable NX)
+    add edx, 8                          ; Next QWORD entry slot
+    add eax, 0x1000                     ; Stride next physical frame by 4KB
+    dec ecx
+    jnz .loop_vtd_pt_mapping
+
 
 switch_to_long_mode:
     mov eax, 0x1000                     ; Point CR3 directly to the PML4 page table root
