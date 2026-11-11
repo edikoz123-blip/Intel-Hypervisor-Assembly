@@ -2,11 +2,10 @@
 [org 0x5000]        
 
 ; =========================================================================
-; DISCLAIMER: This project is currently a Work-In-Progress (WIP) and is NOT
-; ready for production deployment. Everything is built from scratch in pure
-; Assembly, including firmware/motherboard protections (ACPI, SMBIOS, etc.)
-; mirrored across both the Intel (VMX/FRED) and the second project
-; AMD hypervisor.
+; DISCLAIMER: This hypervisor project is currently a Work-In-Progress (WIP) 
+; and is NOT ready for production deployment. Everything is built from scratch
+; in pure Assembly, including firmware/motherboard protections (ACPI, SMBIOS, etc.)
+; and the second project AMD hypervisor.
 ; =========================================================================
 
 
