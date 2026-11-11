@@ -1,5 +1,14 @@
 [bits 64]
-[org 0x5000]           
+[org 0x5000]        
+
+; =========================================================================
+; DISCLAIMER: This project is currently a Work-In-Progress (WIP) and is NOT
+; ready for production deployment. Everything is built from scratch in pure
+; Assembly, including firmware/motherboard protections (ACPI, SMBIOS, etc.)
+; mirrored across both the Intel (VMX/FRED) and the second project
+; AMD hypervisor.
+; =========================================================================
+
 
 ; ============================================================================
 ; THERMAL AND TEMPERATURE SENSORS
@@ -1171,6 +1180,8 @@ configure_vmcs_raw:
 ; ==============================================================================
 
 init_vm_entry_control_fields:
+VMENTRY_LOAD_IA32_FRED          EQU (1 << 23)
+
     ; -------------------------------------------------------------------------
     ; 1. Sync and Validate Hardware VM-Entry Controls
     ; -------------------------------------------------------------------------
@@ -1181,7 +1192,7 @@ init_vm_entry_control_fields:
     mov r9d, 0x00000204                 ; Requested: IA32e/Long-Mode Guest (Bit 2) + Isolation Controls
     and r8, r9                          ; Sanitize requested bits against physical capabilities
     or  rax, r8                         ; Fuse mandatory 1 bits with optimized parameters
-    
+    or rax, VMENTRY_LOAD_IA32_FRED
     mov rcx, VMCS_CTRL_VMENTRY_CONTROLS ; Encoding: 0x00004012
     vmwrite rcx, rax               
 
@@ -1374,8 +1385,7 @@ init_hardware_defender_and_paging:
     or  eax, 0x00000003                 ; Assert strict hardware execution barrier bits
     xor edx, edx                        ; Isolate and clean the upper tracking channel
     wrmsr                        
-
- Initialize_Intel_VTd_IOMMU_Hardware:
+Initialize_Intel_VTd_IOMMU_Hardware:
     ; -------------------------------------------------------------------------
     ; A. Clear exactly 8KB for VT-d Paging structures (0x95000 and 0x96000)
     ; -------------------------------------------------------------------------
@@ -1385,37 +1395,62 @@ init_hardware_defender_and_paging:
     rep stosq                           ; Wipe dirty legacy footprint cleanly
 
     ; -------------------------------------------------------------------------
-    ; B. Weave the structural lifecycle links inside the VT-d matrices
+    ; B. Weave the structural lifecycle links inside the VT-d matrices (128-bit Entries!)
     ; -------------------------------------------------------------------------
-    mov rax, VTD_PAGE_TABLE_LEVEL2      ; Level-2 allocation link target (0x00096001)
-    mov [VTD_PAGE_TABLE_ROOT], rax      ; Link Root -> Level-2 Table
+    ; 1. Root Entry (Bus 0): Point to Context Table at 0x96000. Bit 0 = Present
+    mov rax, VTD_PAGE_TABLE_LEVEL2      ; 0x00096000
+    or  rax, 1                          ; Set Present Bit
+    mov [VTD_PAGE_TABLE_ROOT], rax      ; Lower 64-bit of Bus 0 Root Entry
+    mov qword [VTD_PAGE_TABLE_ROOT + 8], 0 ; Upper 64-bit of Bus 0 Root Entry (Clear/Reserved)
     
-    ; Connect the VT-d hardware directly to our advanced 10GB EPT PML4 at 0x11000
+    ; 2. Context Entry (Dev 0, Fn 0): Point to EPT PML4. 
+    ; Translation Type = 0x1 (Multi-level page table) or EPT mapping based on ECAP
     mov rax, EPT_PML4_BASE_ADDRESS      ; Target: 0x00011000
-    or  rax, 0x15                       ; Inject synchronization attributes and valid entry bits
-    mov [0x00096000], rax               ; Secure layout binding complete
+    or  rax, 0x15                       ; Your synchronization and attribute flags (Ensure compatibility with T&AW)
+    mov [VTD_PAGE_TABLE_LEVEL2], rax    ; Lower 64-bit of Context Entry
+    ; In the upper 64-bit, we must set Domain ID (e.g., Domain 1) to isolate this space
+    mov qword [VTD_PAGE_TABLE_LEVEL2 + 8], 0x0001 ; Domain ID = 1, Address Width, etc.
 
     ; -------------------------------------------------------------------------
     ; C. Flash Configuration Matrix directly to the physical Chipset Base
     ; -------------------------------------------------------------------------
-    mov rbx, VTD_IOMMU_MMIO_BASE        ; RBX = Absolute Hardware Address Window: 0xFED90000
-    mov rax, VTD_PAGE_TABLE_ROOT        ; Pointer linkage base (0x00095000)
-    mov [rbx + VTD_IOMMU_RTADDR_REG], rax ; Force the IOMMU hardware to track our root table
+    mov rbx, VTD_IOMMU_MMIO_BASE        ; RBX = 0xFED90000
+    mov rax, VTD_PAGE_TABLE_ROOT        ; 0x00095000
+    mov [rbx + VTD_IOMMU_RTADDR_REG], rax ; Set Root Table Address
+
+    ; The operation we performed here is a direct write to MMIO (Memory-Mapped I/O).
+    ; This is a specific physical memory window (0xFED90000) that Intel maps directly 
+    ; to the chipsets internal silicon configuration registers rather than the RAM.
+    ; By executing this MOV command, the CPU bypasses the cache and dispatches an 
+    ; electrical control signal straight to the Intel VT-d hardware unit, forcing 
+    ; the IOMMU to track and latch our custom 128-bit Root Table pointer.
+
+    ; -------------------------------------------------------------------------
+    ; C2. FORCE CHIPSET TO COMMIT ROOT TABLE POINTER (SRTP COMMAND)
+    ; -------------------------------------------------------------------------
+    mov eax, [rbx + VTD_IOMMU_GCMD_REG]
+    or  eax, 0x40000000                 ; Assert Bit 30 (Set Root Table Pointer - SRTP)
+    mov [rbx + VTD_IOMMU_GCMD_REG], eax
+
+.vtd_srtp_sync_loop:
+    mov eax, [rbx + VTD_IOMMU_GSTS_REG]
+    and eax, 0x40000000                 ; Poll Bit 30 (Root Table Pointer Status - RTPS)
+    jz  .vtd_srtp_sync_loop             ; Wait until Silicon locks the Root Table Pointer
 
     ; -------------------------------------------------------------------------
     ; D. Trigger and Enforce Active Global Hardware Synchronization Command
     ; -------------------------------------------------------------------------
-    mov eax, [rbx + VTD_IOMMU_GCMD_REG] ; Read active hardware command configuration
-    or  eax, 0x80000000                 ; Assert command bit 31 (Global Translation Enable)
-    mov [rbx + VTD_IOMMU_GCMD_REG], eax ; Dispatch electrical activation impulse to the chipset
+    mov eax, [rbx + VTD_IOMMU_GCMD_REG] 
+    or  eax, 0x80000000                 ; Assert bit 31 (Global Translation Enable - TE)
+    mov [rbx + VTD_IOMMU_GCMD_REG], eax 
 
     ; -------------------------------------------------------------------------
     ; E. Strict Microarchitectural Polling Loop (Wait for Silicon Acknowledgement)
     ; -------------------------------------------------------------------------
 .vtd_hardware_sync_loop:
-    mov eax, [rbx + VTD_IOMMU_GSTS_REG] ; Poll the physical Global Status Register (Offset 0x1C)
-    and eax, 0x80000000                 ; Mask and isolate status bit 31 (Translation Status)
-    jz  .vtd_hardware_sync_loop         ; Tight assembly lock path until the translation cycle commits complete
+    mov eax, [rbx + VTD_IOMMU_GSTS_REG] 
+    and eax, 0x80000000                 ; Mask and isolate status bit 31 (Translation Status - TES)
+    jz  .vtd_hardware_sync_loop         ; Loop until committed
 
     ; -------------------------------------------------------------------------
     ; 2. Construct Ultra-Defensive EPT Partition with Advanced Silicon Armoring
@@ -1591,10 +1626,81 @@ _tss_fragment_confirm:
     or  edx, MSR_IA32_MISC_ENABLE_CPUID_MAX_VAL_BIT 
     wrmsr
 
-    
+    ; ==============================================================================
+    ;                           FRED the new IDT
+    ; ==============================================================================
+
+FRED_FRAME_ERRCODE      EQU 0x00    ; 64-bit Error Code
+FRED_FRAME_RIP          EQU 0x08    ; 64-bit Return RIP
+FRED_FRAME_CS           EQU 0x10    ; 64-bit CS + Event Info
+FRED_FRAME_RFLAGS       EQU 0x18    ; 64-bit RFLAGS
+FRED_FRAME_RSP          EQU 0x20    ; 64-bit Previous RSP
+FRED_FRAME_SS           EQU 0x28    ; 64-bit SS + Vector + Event Type
+FRED_FRAME_EVENT_DATA   EQU 0x30    ; 64-bit Extra Event Data (e.g., CR2 on #PF)
+FRED_FRAME_RESERVED     EQU 0x38    ; 64-bit Reserved (0)
+
+MSR_IA32_FRED_RSP1      EQU 0x1CD
+; Holds the Stack Pointer (RSP) for Ring 0 Stack Level 1 (used for standard interrupts/exceptions).
+MSR_IA32_FRED_RSP2      EQU 0x1CE
+; Holds the Stack Pointer (RSP) for Ring 0 Stack Level 2 (used for nested/higher-priority faults).
+MSR_IA32_FRED_RSP3      EQU 0x1CF
+; Holds the Stack Pointer (RSP) for Ring 0 Stack Level 3 (reserved for critical faults like #DF Double Fault or #MC).
+MSR_IA32_FRED_STKLVLS   EQU 0x1D0
+; A 64-bit bitmask (2 bits per vector for vectors 0–31) telling the CPU which stack level (0–3) to switch to when a specific exception fires.
+MSR_IA32_FRED_CONFIG    EQU 0x1D4
+; Holds the 4KB-aligned base address of your FRED handler code (Base + 0x0 for Ring 3, Base + 0x100 for Ring 0) plus configuration flags in bits 0–11.
+CR4_FRED_BIT            EQU (1 << 32)
+; Represents Bit 32 of Control Register 4 (CR4). Setting this bit to 1 turns on FRED mode and disables the legacy IDT.
+
+; =========================================================================
+; VMCS Field Encodings for FRED Host-State (64-bit Fields)
+; =========================================================================
+VMCS_HOST_IA32_FRED_CONFIG      EQU 0x00002C14
+VMCS_HOST_IA32_FRED_RSP1        EQU 0x00002C16
+VMCS_HOST_IA32_FRED_RSP2        EQU 0x00002C18
+VMCS_HOST_IA32_FRED_RSP3        EQU 0x00002C1A
+VMCS_HOST_IA32_FRED_SSP1        EQU 0x00002C1C
+VMCS_HOST_IA32_FRED_SSP2        EQU 0x00002C1E
+VMCS_HOST_IA32_FRED_SSP3        EQU 0x00002C20
+VMCS_HOST_IA32_FRED_STKLVLS     EQU 0x00002C22
+
+; =========================================================================
+; VM-Exit Controls Encoding & Control Bit
+; =========================================================================
+VMCS_CTRL_VMEXIT_CONTROLS       EQU 0x0000400C
+VMEXIT_LOAD_IA32_FRED           EQU (1 << 31)
+
+; =========================================================================
+; Stack Top Constants (0x90000 - 0x9F000 Layout)
+; =========================================================================
+FRED_STACK_LVL1_TOP             EQU 0x000000000009F000
+FRED_STACK_LVL2_TOP             EQU 0x000000000009D000
+FRED_STACK_LVL3_TOP             EQU 0x000000000009B000
+
+VMCS_GUEST_IA32_FRED_CONFIG     EQU 0x0000281A
+VMCS_GUEST_IA32_FRED_RSP1       EQU 0x0000281C
+VMCS_GUEST_IA32_FRED_RSP2       EQU 0x0000281E
+VMCS_GUEST_IA32_FRED_RSP3       EQU 0x00002820
+VMCS_GUEST_IA32_FRED_SSP1       EQU 0x00002822
+VMCS_GUEST_IA32_FRED_SSP2       EQU 0x00002824
+VMCS_GUEST_IA32_FRED_SSP3       EQU 0x00002826
+VMCS_GUEST_IA32_FRED_STKLVLS    EQU 0x00002828
+
+VMCS_CTRL_VMENTRY_CONTROLS      EQU 0x00004012
+;for activating it you need to use VMENTRY CONTROLS and use bit 23 
+;the name for the constant is VMENTRY_LOAD_IA32_FRED
+
+
+
+
     ; Tommorow your work on the Defenses (EPT TSS IOMMU) and make them advance as possible you did EPT and you need to finish IOMMU
     ; but you need to double check them 
     ; and you didnt do TSS and IDT that tommorow problem and see if there any more things
+
+    ;the defenses you need to build: IOMMU, EPT, TSS, IDT or FRED, MKTME, CET
+    ;Key Locker, TDT, VPID, SMAP and SMEP, UMIP, APICv, MPK / PKEYS, LBR, MBEC(for EPT), 
+    ;CR4.MCE, Virtualize TSC, Write-Protection Dirty Bits, HLAT, Bus Lock Detection, 
+    ;LAM, LASS, BHI_DIS_S Controls, Enhanced VM-Entry, UCODE, TXT, 
 
 ;----------------- PART 8: LAUNCHING -----------------
 
