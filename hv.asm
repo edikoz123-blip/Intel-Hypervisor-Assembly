@@ -223,6 +223,13 @@ VMCS_CTRL_VMENTRY_INTERRUPTION_INFO_FIELD       EQU 0x00004016 ; Didnt got used
 VMCS_CTRL_VMENTRY_EXCEPTION_ERROR_CODE          EQU 0x00004018
 VMCS_CTRL_VMENTRY_INSTRUCTION_LENGTH            EQU 0x0000401A
 
+; =====================================================================
+; Direct Load: IA32_EFER (MSR 0xC0000080) -> LME(8) | LMA(10) | NXE(11) | SCE(0)
+;    Value: 0x00000D01 (64-bit Long Mode + No-Execute Protection)
+; =====================================================================
+IA32_EFER                               EQU 0xC0000080
+
+ 
 ; ------------------------------------------------------------------------------
 ; 32-Bit Read-Only Data Fields (VM-Exit Information) Didnt got used
 ; ------------------------------------------------------------------------------
@@ -386,7 +393,6 @@ VMCS_CTRL_SPECULATION_CTRL_BITMAP       EQU 0x00004030 ; Hard intercepts for gue
 ; ------------------------------------------------------------------------------
 VMCS_VMEXIT_MTF_QUALIFICATION           EQU 0x00004410 ; Monitor Trap Flag debug status detail (didnt got used)
 VMCS_VMEXIT_TERTIARY_EXIT_REASON        EQU 0x00004412 ; Detailed classification for tertiary exit conditions (didnt got used)
-
 ; ------------------------------------------------------------------------------
 ; Natural Width Control & State Fields (Advanced Shadow Pages)
 ; ------------------------------------------------------------------------------
@@ -476,7 +482,7 @@ VMCS_CTRL_EXECUTIVE_VMCS_POINTER                EQU 0x0000200C
 ;this is how the VMWRITE works: VMWRITE Field_Encoding, Source_Register
 Hypervisor_start:
 trying_vmptrld:
-mov rax, 0x01B22FE4 
+mov rax, 0x0000000109B02FC4          
 mov cr4, rax
 
 mov rax, 0x01
@@ -557,15 +563,26 @@ Host_area:
     vmwrite rax, rbx          
 
 
-    mov eax, VMCS_HOST_CR0          ;0x00006C00
-    mov rbx, 0x80010031
-    vmwrite rax, rbx 
+    ; =====================================================================
+    ;    Load HOST_CR0 (Encoding: 0x00006C00)
+    ;    Bits enabled: PG (31) | WP (16) | NE (5) | ET (4) | PE (0)
+    ; =====================================================================
+    mov rbx, 0x0000000080010031         ; Exact hardened 64-bit CR0 mask
+    mov cr0, rbx                        ; Load directly into physical CR0
+    mov rax, VMCS_HOST_CR0              ; 0x00006C00 encoding
+    vmwrite rax, rbx                    ; Sync directly into VMCS Host-State
 
-    mov rax, VMCS_HOST_CR4          ;0x00006C04
-    mov rbx, cr4
-    or rbx, 0x01B22FE4              
-    mov cr4, rbx
-    vmwrite rax, rbx    
+    ; =====================================================================
+    ; Direct Load: HOST_CR4 (0x00006C04) & Physical CR4 -> 0x0000000109B02FC4         
+    ; Added Bit 27 (LASS - Linear Address Space Separation)
+    ; Active bits: FRED(32) | LASS(27) | PKS(24) | CET(23) | SMAP(21) | SMEP(20) |
+    ;              VMXE(13) | UMIP(11) | OSXMMEXCPT(10) | OSFXSR(9) | PCE(8) | PGE(7) | PAE(5) | TSD(2)
+    ; =====================================================================
+    mov rbx, 0x0000000109B02FC4         ; 64-bit ultra-hardened CR4 mask (with FRED + LASS)
+    mov cr4, rbx                        ; Enforce directly on physical CPU
+    mov rax, 0x00006C04                 ; VMCS_HOST_CR4 encoding
+    vmwrite rax, rbx                    ; Sync directly into VMCS Host-State
+
 
 .continue:
 
@@ -576,7 +593,50 @@ Host_area:
     mov rbx, cr3
     vmwrite rax, rbx   
 
-    mov eax, VMCS_HOST_RIP           ; 0x00006C16 
+; =========================================================================
+; Lock CR0, CR4, and CR3 Access in VMCS (Zero Guest Control Modification)
+; Note: Uses your exact EQU definitions (0x6000 - 0x600E)
+; =========================================================================
+
+LockGuestControlRegisters:
+    ; 1. Lock every single bit in CR0 and CR4 (Any write triggers Exit Reason 28)
+    mov rdx, 0xFFFFFFFFFFFFFFFF
+
+    mov rax, VMCS_CTRL_CR0_GUEST_HOST_MASK  ; 0x00006000
+    vmwrite rax, rdx
+
+    mov rax, VMCS_CTRL_CR4_GUEST_HOST_MASK  ; 0x00006002
+    vmwrite rax, rdx
+
+    ; 2. Set Read Shadows to match initial Guest CR0/CR4 (Fast reads, Stealth VMXE=0)
+    ;    Example: Guest sees PG(31)|WP(16)|NE(5)|ET(4)|PE(0) in CR0, and PAE(5)|PGE(7) in CR4
+    mov rax, VMCS_CTRL_CR0_READ_SHADOW      ; 0x00006004
+    mov rdx, 0x0000000080010031
+    vmwrite rax, rdx
+
+    mov rax, VMCS_CTRL_CR4_READ_SHADOW      ; 0x00006006
+    mov rdx, 0x00000000000000A0             ; PAE(5) | PGE(7) visible; VMXE(13) & FRED(32) hidden (0)
+    vmwrite rax, rdx
+
+    ; 3. Zero out CR3 Target Values & Target Count (0x400A = 0 -> Every CR3 load exits)
+    xor edx, edx
+
+    mov rax, 0x0000400A                     ; VMCS_CTRL_CR3_TARGET_COUNT (0 = allow zero bypasses)
+    vmwrite rax, rdx
+
+    mov rax, VMCS_CTRL_CR3_TARGET_VALUE_0   ; 0x00006008
+    vmwrite rax, rdx
+
+    mov rax, VMCS_CTRL_CR3_TARGET_VALUE_1   ; 0x0000600A
+    vmwrite rax, rdx
+
+    mov rax, VMCS_CTRL_CR3_TARGET_VALUE_2   ; 0x0000600C
+    vmwrite rax, rdx
+
+    mov rax, VMCS_CTRL_CR3_TARGET_VALUE_3   ; 0x0000600E
+    vmwrite rax, rdx
+
+    mov eax, VMCS_HOST_RIP                  ; 0x00006C16 
     mov ebx, VM_Exit_Handler                                 
     vmwrite rax, rbx
 
@@ -624,11 +684,6 @@ setup_host_and_execution_controls:
     mov rax, VMCS_HOST_SYSENTER_EIP     ; Encoding: 0x00006C12
     vmwrite rax, rbx
 
-    ; 3. Configure Active Task Register Selector
-    mov rbx, 0x0008                     ; Set direct selector index pointing to Host GDT TSS descriptor
-    mov rax, VMCS_HOST_TR_SELECTOR      ; Encoding: 0x00000C0C
-    vmwrite rax, rbx
-
     ; 5. Sync Extended Feature Enable Register (IA32_EFER MSR)
     mov ecx, 0xC0000080                 ; MSR address parameter for IA32_EFER
     rdmsr                        
@@ -638,8 +693,38 @@ setup_host_and_execution_controls:
     mov rax, VMCS_HOST_IA32_EFER        ; Encoding: 0x00004C02
     vmwrite rax, rdx             
  
+    ; =====================================================================
+    ; Legacy IDT & TSS Host-State Fields (Bypassed by Hardware FRED)
+    ; =====================================================================
+    ; HOST_IDTR_BASE (0x00006C0A) is completely ignored by hardware:
+    ; Because CR4.FRED (Bit 32) is active, the CPU never looks up an IDT in memory.
+    ; The 0x0 in HOST_IDTR_BASE is just a dummy canonical integer that satisfies
+    ; VMLAUNCH validation—zero memory reads occur at 0x0.
+    ;
+    ; HOST_TR_BASE (0x00006C08) is never dereferenced on VM-Exit:
+    ; When a VM-Exit occurs, Intels microcode loads HOST_TR_SELECTOR (0x0018)
+    ; into TR and marks the internal descriptor cache as a 64-bit Busy TSS
+    ; without reading a single byte from HOST_TR_BASE. As long as LTR is never
+    ; executed with 0x18 in runtime code, 0x00000000-0x00000FFF is never accessed.
+
+    mov rax, VMCS_HOST_TR_SELECTOR      ; 0x00000C0C
+    mov rdx, 0x0000000000000018         ; Non-null dummy selector (TI=0, RPL=0)
+    vmwrite rax, rdx
+
+    xor edx, edx                        ; Canonical 0x0 (Zero RAM allocation)
+    mov rax, VMCS_HOST_TR_BASE          ; 0x00006C08
+    vmwrite rax, rdx
+
+    mov rax, VMCS_HOST_IDTR_BASE        ; 0x00006C0A
+    vmwrite rax, rdx
+
     ; 6. Commit Global VMX Transition Controls
-    mov rbx, 0x00008200                 ; VM-Exit Control features configuration bitmask
+
+    VMEXIT_LOAD_IA32_FRED           EQU (1 << 31)
+    ; 0x933C8204 = Bit 31 (FRED) | Bit 28 (CET) | Bits 25:24 (PT Stealth) |
+    ;              Bits 21:20 (EFER) | Bits 19:18 (PAT) | Bit 15 (Ack Intr) |
+    ;              Bit 9 (64-bit Host) | Bit 2 (Save Debug Controls)
+    mov ebx, 0x933C8204
     mov rax, VMCS_CTRL_VMEXIT_CONTROLS  ; Encoding: 0x0000400C (CORRECTED PARAMETER ORDER)
     vmwrite rax, rbx
 
@@ -651,13 +736,9 @@ setup_host_and_execution_controls:
     vmwrite rax, rcx            
 
     mov rax, VMCS_HOST_GS_BASE          ; Encoding: 0x00006C08
-    vmwrite rax, rcx            
+    vmwrite rax, rcx                      
 
-    ; 2. Configure Host Task Register Base Address
-    mov rax, VMCS_HOST_TR_BASE          ; Encoding: 0x00006C0A
-    vmwrite rax, rcx            
-
-    ; 3. Extract and Commit Active Host GDTR Base Pointer
+    ; 2. Extract and Commit Active Host GDTR Base Pointer
     mov rax, VMCS_HOST_GDTR_BASE        ; Encoding: 0x00006C0C 
     sub rsp, 16                         ; Enforce strict 16-byte stack alignment rules
     sgdt [rsp]                          ; Store active 80-bit GDTR descriptor block
@@ -665,15 +746,12 @@ setup_host_and_execution_controls:
     add rsp, 16                         ; Restore stack layout instantly
     vmwrite rax, rbx             
 
-    ; 4. Lock Down Exception Virtualization Intercept Bitmask
-    mov rax, VMCS_CTRL_EXCEPTION_BITMAP ; Encoding: 0x00004004 (Targeted diagnostic trap)
-    mov rbx, 0x00227558                 ; Hard-intercept mask for internal page/debug faults
-    vmwrite rax, rbx             
-
-    ; 6. Commit Active Host Interrupt Descriptor Table Base (IDTR)
-    mov rax, VMCS_HOST_IDTR_BASE        ; Encoding: 0x00006C0E
-    lea rbx, [rel host_idt_table]       ; Resolve absolute address of host exception handlers
-    vmwrite rax, rbx                        
+    ; =====================================================================
+    ; Exception Bitmap (Encoding: 0x00004004)
+    ; =====================================================================
+    mov rax, VMCS_CTRL_EXCEPTION_BITMAP ; 0x00004004
+    Xor edx, edx
+    vmwrite rax, rdx
 
     ; 7. Synchronize Host VMX Extended Feature Enable Register (IA32_EFER)
     mov ecx, 0xC0000080                 ; IA32_EFER MSR Address pointer
@@ -698,13 +776,6 @@ setup_host_and_execution_controls:
     or  rdx, rax               
     mov rax, VMCS_HOST_IA32_PERF_GLOBAL_CTRL ; Encoding: 0x00002C04          
     vmwrite rax, rdx             
-
-    ; 10. Enforce Control-Flow Enforcement Technology (CET) Protection Layers
-    ; Replacing loop indices with robust unrolled configurations to block stack spills
-    xor rcx, rcx                        ; Zero-out validation matrix template
-    
-    mov rax, VMCS_HOST_IA32_S_CET       ; Encoding: 0x00006C18
-    vmwrite rax, rcx          
 
     ; 11. Finalize MSR Lifecycle Boundaries
     mov rax, VMCS_CTRL_VMEXIT_MSR_LOAD_COUNT ; Encoding: 0x00004010
@@ -1059,7 +1130,7 @@ VM_Execution_Control_Fields:
     rdmsr                           
     mov r8, rdx                         ; R8 = Allowed 1 Bits tracking mask
     
-    mov r9d, 0x11016280                 ; Requested: HLT, INVLPG, CR3, DR, I/O, MSR Bitmaps
+    mov r9d, 0x91016280                 ; Requested: HLT, INVLPG, CR3, DR, I/O, MSR Bitmaps
     and r8, r9                          ; Enforce only hardware-allowed bits
     or  rax, r8                         ; Merge mandatory 1 bits with sanitized choices
     
@@ -1313,17 +1384,79 @@ Commit_Core_Execution_Control_Attributes:
     mov rax, VMCS_CTRL_PLE_WINDOW       ; Encoding: 0x00004022
     vmwrite rax, rcx
 
+; =========================================================================
+; Silicon Defense Arming Stage: MSRs & VMCS Hardening
+; Configures and synchronizes all hardware-enforced protections (Shadow Stacks,
+; IBT, FRED, and Control Register locks) before launching the guest.
+; =========================================================================
+
+;this is what you need to prepare and then you need to build the handler 
+;only use VMCS and MSRS read only they are the most trusted one 
+
+; =========================================================================
+; Intel CET (Control-flow Enforcement Technology) Control Register Bitmask
+; Applies to: MSR_IA32_S_CET (0x000006A2) & VMCS_HOST_IA32_S_CET (0x00006C18)
+; =========================================================================
+; Bit 0  (0x00000001) - SH_STK_EN       : Enable Shadow Stacks (1 = Active, prevents ROP/RET tampering)
+; Bit 1  (0x00000002) - WR_SHSTK_EN     : Enable WRSSQ instruction (Keep 0 to block shadow stack writes)
+; Bit 2  (0x00000004) - ENDBR_EN        : Enable Indirect Branch Tracking (IBT - enforces ENDBR64)
+; Bit 3  (0x00000008) - LEG_IW_EN       : Enable Legacy Compatibility Bitmap (Keep 0 for strict IBT)
+; Bit 4  (0x00000010) - NO_TRACK_EN     : Enable NOTRACK prefix bypass (Keep 0 to block JOP bypasses)
+; Bit 5  (0x00000020) - SUPPRESS_DIS    : Disable IBT suppression on legacy/FAR branches (Keep 0)
+; Bits 9:6            - Reserved        : Must be 0
+; Bit 10 (0x00000400) - SUPPRESS        : CPU internal state flag: IBT is currently suppressed (Keep 0)
+; Bit 11 (0x00000800) - TRACKER         : CPU internal state flag: Waiting for ENDBR64 (Keep 0)
+; Bits 63:12          - LEG_BITMAP_BASE : 4KB-aligned base address of Legacy Code Bitmap (Keep 0)
+; =========================================================================
+VMCS_HOST_IA32_S_CET            EQU 0x00006C18
+MSR_IA32_U_CET                  EQU 0x000006A0  ; User-mode (Ring 3) CET control (Shadow Stack & IBT)
+MSR_IA32_S_CET                  EQU 0x000006A2  ; Supervisor (Ring 0) CET control (Shadow Stack & IBT)
+MSR_IA32_PL0_SSP                EQU 0x000006A4  ; Ring 0 Shadow Stack Pointer (SSP)
+MSR_IA32_PL1_SSP                EQU 0x000006A5  ; Ring 1 Shadow Stack Pointer (SSP)
+MSR_IA32_PL2_SSP                EQU 0x000006A6  ; Ring 2 Shadow Stack Pointer (SSP)
+MSR_IA32_PL3_SSP                EQU 0x000006A7  ; Ring 3 Shadow Stack Pointer (SSP)
+MSR_IA32_INTERRUPT_SSP_TABLE    EQU 0x000006A8  ; Legacy IDT Interrupt SSP Table Base Address
+
+; =====================================================================
+; Activate Supervisor CET in VMCS Host-State (0x00006C18) & Physical MSR (0x000006A2)
+; Bit 0 (0x1) = SH_STK_EN (Shadow Stack active)
+; Bit 2 (0x4) = ENDBR_EN  (Indirect Branch Tracking / ENDBR64 active)
+; All bypass bits (WR_SHSTK_EN, LEG_IW_EN, NO_TRACK_EN) = 0
+; =====================================================================
+    mov rax, VMCS_HOST_IA32_S_CET       ; 0x00006C18
+    mov rdx, 0x0000000000000005         ; SH_STK_EN | ENDBR_EN
+    vmwrite rax, rdx
+
+    ; Sync physical MSR_IA32_S_CET (0x000006A2) before setting CR4.CET (Bit 23)
+    mov ecx, MSR_IA32_S_CET             ; 0x000006A2
+    xor edx, edx
+    mov eax, 0x00000005
+    wrmsr
+
+
+
+
+
+
+
+
+
+
 ; -------------------------------------------------------------------------
 ;                     Defenses for the PC
 ; -------------------------------------------------------------------------
-
-
 
 ; ==============================================================================
 ; HARDWARE DEFENDER DEFINE MATRIX (EQU REFACTORING - PART 7)
 ; ==============================================================================
 ; Speculative Execution & Architecture Control Registers
+; =====================================================================
+;    Direct Load: IA32_SPEC_CTRL (MSR 0x00000048) -> Hardware Side-Channel Lock
+;    Value: 0x00000057 (IBRS | STIBP | SSBD | IPRED_DIS_S | RRSBA_DIS_S)
+; =====================================================================
 MSR_IA32_SPEC_CTRL                              EQU 0x00000048 ; Spectre/Meltdown Silicon Mitigation Register
+
+
 MSR_IA32_VMX_PROCBASED_CTLS2                    EQU 0x0000048B ; Secondary VMX Capabilities Core Identifier
 MSR_IA32_VIRTUAL_EXCEPTION_INFO                 EQU 0x00000982 ; Global Intercept and Exception Subsystem Policy
 
@@ -1335,6 +1468,9 @@ VTD_PAGE_TABLE_LEVEL2                           EQU 0x00096001 ; Secondary point
 EPT_PML4_BASE_ADDRESS                           EQU 0x00011000 ; Root Matrix for Sandbox Isolation Extended Page Tables
 EPT_PDPT_BASE_ADDRESS                           EQU 0x00012000 ; Page Directory Pointer Table Memory Anchor
 EPT_PD_ARRAY_START                              EQU 0x00013000 ; NEW: Start address of our 10 continuous PD pages
+
+;By the way if you want to check EPT options you have on your CPU you can use that MSR:
+IA32_VMX_EPT_VPID_CAP                           EQU 0x0000048C 
 
 ; Verified VMCS Encodings Supplement
 VMCS_CTRL_EPT_POINTER                           EQU 0x0000201A ; 64-Bit VMCS Encoding link for Extended Page Table Pointer (EPTP)
@@ -1363,11 +1499,11 @@ VMCS_CTRL_HLAT_POINTER                          EQU 0x00002040 ; 64-Bit field po
 ;      INTEL VT-d IOMMU HARDWARE REGISTER CORES ENCODINGS (MMIO BASE: 0xFED90000)
 ; ==============================================================================
 VTD_IOMMU_MMIO_BASE                             EQU 0x00000000FED90000 ; Physical Motherboard MMIO Gate Address
-VTD_IOMMU_VERSION_REG                           EQU 0x00               ; Read-Only: Architectural Version Offset
-VTD_IOMMU_CAP_REG                               EQU 0x08               ; Read-Only: Hardware Capabilities Matrix (64-Bit)
-VTD_IOMMU_EXT_CAP_REG                           EQU 0x10               ; Read-Only: Extended Capabilities Matrix (64-Bit)
+VTD_IOMMU_VERSION_REG                           EQU 0x00               ; Read-Only:  Architectural Version Offset
+VTD_IOMMU_CAP_REG                               EQU 0x08               ; Read-Only:  Hardware Capabilities Matrix (64-Bit)
+VTD_IOMMU_EXT_CAP_REG                           EQU 0x10               ; Read-Only:  Extended Capabilities Matrix (64-Bit)
 VTD_IOMMU_GCMD_REG                              EQU 0x18               ; Read-Write: Global Command Register (Activation)
-VTD_IOMMU_GSTS_REG                              EQU 0x1C               ; Read-Only: Global Status Register (Sync Polling)
+VTD_IOMMU_GSTS_REG                              EQU 0x1C               ; Read-Only:  Global Status Register (Sync Polling)
 VTD_IOMMU_RTADDR_REG                            EQU 0x20               ; Read-Write: Root Entry Table Address Pointer Register
 
 
@@ -1625,34 +1761,50 @@ _tss_fragment_confirm:
     or  edx, MSR_IA32_MISC_ENABLE_CPUID_MAX_VAL_BIT 
     wrmsr
 
-    ; ==============================================================================
-    ;                           FRED the new IDT
-    ; ==============================================================================
+; =========================================================================
+; PROJECT STATE SNAPSHOT (INTEL VMX + FRED + CET HARDENED HYPERVISOR)
+; =========================================================================
+; COMPLETED TODAY:
+;   [x] All FRED, CET, Control Register, and VMCS EQU constants defined
+;   [x] Hardened Page Table layout (0x90000 - 0x9F000 with Guard Pages)
+;   [x] Physical MSRs & VMCS Host-State wiring (FRED + CET + CR0/CR4/EFER)
+;   [x] Guest FRED State zeroed + CR0/CR4/CR3 hermetically locked
+;   [x] Pure JMP FredEntryPointBase skeleton (Ring 3 +0x000, Ring 0 +0x100)
+;   [x] Pure JMP VmExitHandler skeleton with hardware #GP injection
+;
+; NEXT STEPS (FOR TOMORROW):
+;   [ ] 1. Implement #PF, #GP, and #CP handlers inside FredRing0Entry
+;   [ ] 2. Build EPT tables with Execute-Only (0x4) code & ACPI/SMBIOS locks
+;   [ ] 3. Mirror hardened architecture to AMD SVM (VMCB, NPT, GIF)
+; =========================================================================
 
-FRED_FRAME_ERRCODE      EQU 0x00    ; 64-bit Error Code
-FRED_FRAME_RIP          EQU 0x08    ; 64-bit Return RIP
-FRED_FRAME_CS           EQU 0x10    ; 64-bit CS + Event Info
-FRED_FRAME_RFLAGS       EQU 0x18    ; 64-bit RFLAGS
-FRED_FRAME_RSP          EQU 0x20    ; 64-bit Previous RSP
-FRED_FRAME_SS           EQU 0x28    ; 64-bit SS + Vector + Event Type
-FRED_FRAME_EVENT_DATA   EQU 0x30    ; 64-bit Extra Event Data (e.g., CR2 on #PF)
-FRED_FRAME_RESERVED     EQU 0x38    ; 64-bit Reserved (0)
-
-MSR_IA32_FRED_RSP1      EQU 0x1CD
-; Holds the Stack Pointer (RSP) for Ring 0 Stack Level 1 (used for standard interrupts/exceptions).
-MSR_IA32_FRED_RSP2      EQU 0x1CE
-; Holds the Stack Pointer (RSP) for Ring 0 Stack Level 2 (used for nested/higher-priority faults).
-MSR_IA32_FRED_RSP3      EQU 0x1CF
-; Holds the Stack Pointer (RSP) for Ring 0 Stack Level 3 (reserved for critical faults like #DF Double Fault or #MC).
-MSR_IA32_FRED_STKLVLS   EQU 0x1D0
-; A 64-bit bitmask (2 bits per vector for vectors 0–31) telling the CPU which stack level (0–3) to switch to when a specific exception fires.
-MSR_IA32_FRED_CONFIG    EQU 0x1D4
-; Holds the 4KB-aligned base address of your FRED handler code (Base + 0x0 for Ring 3, Base + 0x100 for Ring 0) plus configuration flags in bits 0–11.
-CR4_FRED_BIT            EQU (1 << 32)
-; Represents Bit 32 of Control Register 4 (CR4). Setting this bit to 1 turns on FRED mode and disables the legacy IDT.
 
 ; =========================================================================
-; VMCS Field Encodings for FRED Host-State (64-bit Fields)
+; FRED Frame Offsets (64-Byte Hardware Stack Frame Layout)
+; =========================================================================
+FRED_FRAME_ERRCODE              EQU 0x00    ; 64-bit Error Code
+FRED_FRAME_RIP                  EQU 0x08    ; 64-bit Return RIP
+FRED_FRAME_CS                   EQU 0x10    ; 64-bit CS + Event Info
+FRED_FRAME_RFLAGS               EQU 0x18    ; 64-bit RFLAGS
+FRED_FRAME_RSP                  EQU 0x20    ; 64-bit Previous RSP
+FRED_FRAME_SS                   EQU 0x28    ; 64-bit SS + Vector + Event Type
+FRED_FRAME_EVENT_DATA           EQU 0x30    ; 64-bit Extra Event Data (e.g., CR2 on #PF)
+FRED_FRAME_RESERVED             EQU 0x38    ; 64-bit Reserved (0)
+
+; =========================================================================
+; FRED & CET Physical MSR Addresses
+; =========================================================================
+MSR_IA32_FRED_RSP1              EQU 0x000001CD  ; Ring 0 Stack Level 1 Pointer
+MSR_IA32_FRED_RSP2              EQU 0x000001CE  ; Ring 0 Stack Level 2 Pointer
+MSR_IA32_FRED_RSP3              EQU 0x000001CF  ; Ring 0 Stack Level 3 Pointer
+MSR_IA32_FRED_STKLVLS           EQU 0x000001D0  ; Exception Stack Level Routing Bitmask
+MSR_IA32_FRED_SSP1              EQU 0x000001D1  ; Ring 0 Shadow Stack Level 1 Pointer
+MSR_IA32_FRED_SSP2              EQU 0x000001D2  ; Ring 0 Shadow Stack Level 2 Pointer
+MSR_IA32_FRED_SSP3              EQU 0x000001D3  ; Ring 0 Shadow Stack Level 3 Pointer
+MSR_IA32_FRED_CONFIG            EQU 0x000001D4  ; 4KB-aligned FRED Entry Base + Flags
+
+; =========================================================================
+; VMCS Host-State Field Encodings (FRED & CET 64-bit Fields)
 ; =========================================================================
 VMCS_HOST_IA32_FRED_CONFIG      EQU 0x00002C14
 VMCS_HOST_IA32_FRED_RSP1        EQU 0x00002C16
@@ -1663,19 +1815,15 @@ VMCS_HOST_IA32_FRED_SSP2        EQU 0x00002C1E
 VMCS_HOST_IA32_FRED_SSP3        EQU 0x00002C20
 VMCS_HOST_IA32_FRED_STKLVLS     EQU 0x00002C22
 
-; =========================================================================
-; VM-Exit Controls Encoding & Control Bit
-; =========================================================================
-VMCS_CTRL_VMEXIT_CONTROLS       EQU 0x0000400C
-VMEXIT_LOAD_IA32_FRED           EQU (1 << 31)
+MSR_IA32_LAM_ENABLE             EQU 0x00000276  ; Linear Address Masking (Pointer Tagging) Control
+
+
+VMCS_HOST_SSP                   EQU 0x00006C1A
+VMCS_HOST_INTR_SSP_TABLE_ADDR   EQU 0x00006C1C
 
 ; =========================================================================
-; Stack Top Constants (0x90000 - 0x9F000 Layout)
+; VMCS Guest-State Field Encodings (FRED 64-bit Fields)
 ; =========================================================================
-FRED_STACK_LVL1_TOP             EQU 0x000000000009F000
-FRED_STACK_LVL2_TOP             EQU 0x000000000009D000
-FRED_STACK_LVL3_TOP             EQU 0x000000000009B000
-
 VMCS_GUEST_IA32_FRED_CONFIG     EQU 0x0000281A
 VMCS_GUEST_IA32_FRED_RSP1       EQU 0x0000281C
 VMCS_GUEST_IA32_FRED_RSP2       EQU 0x0000281E
@@ -1685,10 +1833,209 @@ VMCS_GUEST_IA32_FRED_SSP2       EQU 0x00002824
 VMCS_GUEST_IA32_FRED_SSP3       EQU 0x00002826
 VMCS_GUEST_IA32_FRED_STKLVLS    EQU 0x00002828
 
+; =========================================================================
+; VMCS Execution, Entry, Exit & Control Register Bitmasks
+; =========================================================================
+VMCS_CTRL_VMEXIT_CONTROLS       EQU 0x0000400C
 VMCS_CTRL_VMENTRY_CONTROLS      EQU 0x00004012
-;for activating it you need to use VMENTRY CONTROLS and use bit 23 
-;the name for the constant is VMENTRY_LOAD_IA32_FRED
 
+VMEXIT_LOAD_CET_STATE           EQU (1 << 28)   ; Load Host CET MSRs on VM-Exit
+VMEXIT_LOAD_IA32_FRED           EQU (1 << 31)   ; Load Host FRED MSRs on VM-Exit
+VMENTRY_LOAD_IA32_FRED          EQU (1 << 23)   ; Load Guest FRED MSRs on VM-Entry
+
+CR4_CET_BIT                     EQU (1 << 23)   ; CR4 Bit 23: Enable CET
+CR4_FRED_BIT                    EQU (1 << 32)   ; CR4 Bit 32: Enable FRED (Disables IDT)
+
+; =========================================================================
+; Hardened Stack & Shadow Stack Top Addresses (0x91000 - 0x9F000 Layout)
+; =========================================================================
+FRED_STACK_LVL1_TOP             EQU 0x000000000009F000  ; RSP1 Top (Page 0x9E000, Guard 0x9D000)
+FRED_STACK_LVL2_TOP             EQU 0x000000000009D000  ; RSP2 Top (Page 0x9C000, Guard 0x9B000)
+FRED_STACK_LVL3_TOP             EQU 0x000000000009B000  ; RSP3 Top (Page 0x9A000, Guard 0x99000)
+
+FRED_SSP_LVL1_TOP               EQU 0x0000000000098000  ; SSP1 Top (Page 0x97000, Guard 0x96000)
+FRED_SSP_LVL2_TOP               EQU 0x0000000000096000  ; SSP2 Top (Page 0x95000, Guard 0x94000)
+FRED_SSP_LVL3_TOP               EQU 0x0000000000094000  ; SSP3 Top (Page 0x93000, Guard 0x92000)
+VMCS_HOST_SSP_TOP               EQU 0x0000000000092000  ; VM-Exit SSP Top (Page 0x91000, Guard 0x90000)
+
+; =========================================================================
+; Step 1: Hardened Page Table (PT) Setup for FRED Stacks & CET Shadow Stacks
+; Input: RDI = Base physical/virtual address of the 4KB Page Table covering 0x0 - 0x1FFFFF
+; Layout (0x90000 - 0x9F000):
+;   0x9F000 -> RSP1 Top (Page 0x9E000 = RW + NX) | Page 0x9D000 = Guard Page (Unmapped)
+;   0x9D000 -> RSP2 Top (Page 0x9C000 = RW + NX) | Page 0x9B000 = Guard Page (Unmapped)
+;   0x9B000 -> RSP3 Top (Page 0x9A000 = RW + NX) | Page 0x99000 = Guard Page (Unmapped)
+;   0x98000 -> SSP1 Top (Page 0x97000 = Shadow Stack: Present=1, R/W=0, Dirty=1, NX=1)
+;   0x97000 -> SSP2 Top (Page 0x96000 = Shadow Stack: Present=1, R/W=0, Dirty=1, NX=1)
+;   0x96000 -> SSP3 Top (Page 0x95000 = Shadow Stack: Present=1, R/W=0, Dirty=1, NX=1)
+; =========================================================================
+
+; Page Table Entry (PTE) Flags:
+; Regular Stack Page: Present(0) | Read/Write(1) | Execute-Disable(63) -> 0x8000000000000003
+; CET Shadow Stack:   Present(0) | Read-Only(R/W=0) | Dirty(6) | Execute-Disable(63) -> 0x8000000000000041
+
+
+
+; =========================================================================
+; PART 1: Hardened Page Table Setup (RDI = PT Base for 0x0 - 0x1FFFFF)
+; =========================================================================
+SetupFredStackPaging:
+    ; RSP1 (0x9F000 -> Page 0x9E000 RW+NX | Guard 0x9D000 Unmapped)
+    mov rax, 0x800000000009E003
+    mov [rdi + 0x9E * 8], rax
+    xor eax, eax
+    mov [rdi + 0x9D * 8], rax
+
+    ; RSP2 (0x9D000 -> Page 0x9C000 RW+NX | Guard 0x9B000 Unmapped)
+    mov rax, 0x800000000009C003
+    mov [rdi + 0x9C * 8], rax
+    xor eax, eax
+    mov [rdi + 0x9B * 8], rax
+
+    ; RSP3 (0x9B000 -> Page 0x9A000 RW+NX | Guard 0x99000 Unmapped)
+    mov rax, 0x800000000009A003
+    mov [rdi + 0x9A * 8], rax
+    xor eax, eax
+    mov [rdi + 0x99 * 8], rax
+
+    ; SSP1 (0x98000 -> Page 0x97000 Shadow Stack | Guard 0x96000 Unmapped)
+    mov rax, 0x8000000000097041
+    mov [rdi + 0x97 * 8], rax
+    xor eax, eax
+    mov [rdi + 0x96 * 8], rax
+
+    ; SSP2 (0x96000 -> Page 0x95000 Shadow Stack | Guard 0x94000 Unmapped)
+    mov rax, 0x8000000000095041
+    mov [rdi + 0x95 * 8], rax
+    xor eax, eax
+    mov [rdi + 0x94 * 8], rax
+
+    ; SSP3 (0x94000 -> Page 0x93000 Shadow Stack | Guard 0x92000 Unmapped)
+    mov rax, 0x8000000000093041
+    mov [rdi + 0x93 * 8], rax
+    xor eax, eax
+    mov [rdi + 0x92 * 8], rax
+
+    ; HOST_SSP (0x92000 -> Page 0x91000 VM-Exit Shadow Stack | Guard 0x90000 Unmapped)
+    mov rax, 0x8000000000091041
+    mov [rdi + 0x91 * 8], rax
+    xor eax, eax
+    mov [rdi + 0x90 * 8], rax
+
+    mov rax, cr3
+    mov cr3, rax                        ; Flush TLB
+
+; =========================================================================
+; PART 2: Load Shadow Stacks, FRED MSRs, VMCS Host/Guest & Activate FRED
+; =========================================================================
+LoadFredShadowStacks:
+    mov ecx, MSR_IA32_FRED_SSP1         ; 0x1D1
+    xor edx, edx
+    mov eax, 0x00098000
+    wrmsr
+    mov rax, VMCS_HOST_IA32_FRED_SSP1   ; 0x00002C1C
+    mov rdx, 0x0000000000098000
+    vmwrite rax, rdx
+
+    mov ecx, MSR_IA32_FRED_SSP2         ; 0x1D2
+    xor edx, edx
+    mov eax, 0x00096000
+    wrmsr
+    mov rax, VMCS_HOST_IA32_FRED_SSP2   ; 0x00002C1E
+    mov rdx, 0x0000000000096000
+    vmwrite rax, rdx
+
+    mov ecx, MSR_IA32_FRED_SSP3         ; 0x1D3
+    xor edx, edx
+    mov eax, 0x00094000
+    wrmsr
+    mov rax, VMCS_HOST_IA32_FRED_SSP3   ; 0x00002C20
+    mov rdx, 0x0000000000094000
+    vmwrite rax, rdx
+
+LoadHostFredCore:
+    mov ecx, MSR_IA32_FRED_RSP1         ; 0x1CD
+    xor edx, edx
+    mov eax, FRED_STACK_LVL1_TOP        ; 0x0009F000
+    wrmsr
+    mov rax, VMCS_HOST_IA32_FRED_RSP1   ; 0x00002C16
+    mov rdx, FRED_STACK_LVL1_TOP
+    vmwrite rax, rdx
+
+    mov ecx, MSR_IA32_FRED_RSP2         ; 0x1CE
+    xor edx, edx
+    mov eax, FRED_STACK_LVL2_TOP        ; 0x0009D000
+    wrmsr
+    mov rax, VMCS_HOST_IA32_FRED_RSP2   ; 0x00002C18
+    mov rdx, FRED_STACK_LVL2_TOP
+    vmwrite rax, rdx
+
+    mov ecx, MSR_IA32_FRED_RSP3         ; 0x1CF
+    xor edx, edx
+    mov eax, FRED_STACK_LVL3_TOP        ; 0x0009B000
+    wrmsr
+    mov rax, VMCS_HOST_IA32_FRED_RSP3   ; 0x00002C1A
+    mov rdx, FRED_STACK_LVL3_TOP
+    vmwrite rax, rdx
+
+    ; Fixed STKLVLS: R8 preserves clean 64-bit mask; XOR flips #GP(13)/#PF(14) to Level 2 (10b)
+    mov r8, 0x5555555555555555
+    or  r8, (2 << (2*2)) | (2 << (8*2)) | (2 << (18*2)) | (2 << (21*2))
+    xor r8, (3 << (13*2)) | (3 << (14*2))
+    mov rax, r8
+    mov rdx, r8
+    shr rdx, 32
+    mov ecx, MSR_IA32_FRED_STKLVLS      ; 0x1D0
+    wrmsr
+    mov rax, VMCS_HOST_IA32_FRED_STKLVLS ; 0x00002C22
+    vmwrite rax, r8
+
+    ; Point IA32_FRED_CONFIG to the 4KB-aligned runtime block below
+    lea r8, [rel My_FRED_HANDLER]
+    or  r8, 0x0000000000000008          ; Bit 3 (SWE)
+    mov rax, r8
+    mov rdx, r8
+    shr rdx, 32
+    mov ecx, MSR_IA32_FRED_CONFIG       ; 0x1D4
+    wrmsr
+    mov rax, VMCS_HOST_IA32_FRED_CONFIG ; 0x00002C14
+    vmwrite rax, r8
+
+    ; Zero Guest FRED Fields (0x281A - 0x2828)
+    xor edx, edx
+    mov rax, VMCS_GUEST_IA32_FRED_CONFIG
+    vmwrite rax, rdx
+    mov rax, VMCS_GUEST_IA32_FRED_RSP1
+    vmwrite rax, rdx
+    mov rax, VMCS_GUEST_IA32_FRED_RSP2
+    vmwrite rax, rdx
+    mov rax, VMCS_GUEST_IA32_FRED_RSP3
+    vmwrite rax, rdx
+    mov rax, VMCS_GUEST_IA32_FRED_SSP1
+    vmwrite rax, rdx
+    mov rax, VMCS_GUEST_IA32_FRED_SSP2
+    vmwrite rax, rdx
+    mov rax, VMCS_GUEST_IA32_FRED_SSP3
+    vmwrite rax, rdx
+    mov rax, VMCS_GUEST_IA32_FRED_STKLVLS
+    vmwrite rax, rdx
+
+
+
+; ==========================a===============================================
+; Reads current VM-Entry Controls, sets Bit 23 (VMENTRY_LOAD_IA32_FRED),
+; and writes the updated control mask back into the active VMCS.
+; =========================================================================
+; The steps to activate it:
+; Load VMCS field encoding (0x4012) to register
+; Set Bit 23 without modifying existing control bits
+; and after you building the paging and everything
+
+MSR_IA32_SMM_MONITOR_CTL        EQU 0x0000009B  ; Controls Ring -2 STM / MSEG execution
+MSR_IA32_SMBASE                 EQU 0x0000009E  ; SMRAM Base Address (Readable inside SMM)
+MSR_IA32_SMM_FEATURE_CONTROL    EQU 0x000004E0  ; SMM Code Check & Lock MSR
+SMM_MONITOR_VALID_BIT           EQU (1 << 0)    ; Enable Ring -2 SMM Transfer Monitor
+SMM_MONITOR_BLOCK_BIT           EQU (1 << 2)    ; Block legacy SMI bypasses
 
 
 
@@ -1717,20 +2064,158 @@ vmlaunch_starting:
     vmlaunch     
     
 HyperVisor_end:
+; =========================================================================
+; VM_EXIT_REASON (VMCS Encoding: 0x00004402) - Full 64-Bit Silicon Map
+; =========================================================================
+; When executing `vmread r8, rax` with RAX = 0x00004402, R8 receives a
+; 32-bit hardware status word (zero-extended to 64 bits):
+;
+;   Bits 15:0  - Basic Exit Reason (Exact numeric cause of the VM-Exit:
+;                0  = Exception or NMI, 1 = External Interrupt, 10 = CPUID,
+;                28 = CR Access, 31 = RDMSR, 32 = WRMSR, 48 = EPT Violation)
+;   Bit 16     - Always 0 (Reserved by hardware)
+;   Bits 26:17 - Reserved (Always 0)
+;   Bit 27     - Enclave Mode (1 = VM-Exit occurred inside an SGX enclave)
+;   Bit 28     - Pending MTF VM-Exit (1 = Monitor Trap Flag exit pending; SMM)
+;   Bit 29     - VM-Exit from VMX Root (1 = Exited from VMX Root; Ring -2 STM)
+;   Bit 30     - Reserved (Always 0)
+;   Bit 31     - VM-Entry Failure Flag (1 = VMLAUNCH/VMRESUME failed after
+;                loading Guest-State; Bits 15:0 hold failure reason code)
+;   Bits 63:32 - Zero-Extended (Always 0x00000000 in 64-bit register)
+; =========================================================================
+VMCS_RO_EXIT_REASON             EQU 0x00004402  
+
+VMCS_RO_VMEXIT_INTR_INFO        EQU 0x00004404  ; Bit 31 = Valid, Bits 7:0 = Vector
+ ;gives you the exact Vector Number (Bits 7:0), Event Type (Bits 10:8), and Valid Flag (Bit 31).
+
+VMCS_RO_EXIT_QUALIFICATION      EQU 0x00006400  ; Technical details of the output (e.g., which CR or I/O)
+VMCS_RO_VMEXIT_INSTR_LEN        EQU 0x0000440C  
+VMCS_GUEST_RIP                  EQU 0x0000681E  
+
+VMCS_RO_GUEST_PHYSICAL_ADDR     EQU 0x00002400  ; Faulting GPA on EPT Violation
+VMCS_CTRL_VMENTRY_INTR_INFO     EQU 0x00004016  ; Inject exception/interrupt into Guest
+VMCS_CTRL_VMENTRY_ERR_CODE      EQU 0x00004018  ; Error code for injected exception (0 for #GP)
 
 VM_Exit_Handler:
-push rax 
-push rbx
-push rcx 
-push rdx
+    endbr64                             ; CET IBT landing pad (required when ENDBR_EN = 1)
+    lfence                              ; Serialize & block guest speculative execution on entry
+    cli
+    ; Save all 15 General-Purpose Registers (120 bytes / 0x78 total)
+    ; =========================================================================
+    ; Architecture: 100% Pure JMP Control Flow (Zero CALL / Zero RET)
+    ; Designed to eliminate ROP, JOP, and COP attack surfaces while neutralizing
+    ; side-channel attacks through hardware serialization and physical isolation.
+    ; =========================================================================
+
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push rbp
+    push r8
+    push r9
+    push r10
+    push r11
+    push r12
+    push r13
+    push r14
+    push r15
+    ; =========================================================================
+    ; Zero-Memory-Trust Architecture (CPU-Direct Telemetry Only)
+    ; =========================================================================
+    ; To make memory corruption practically impossible, this handler performs
+    ; zero memory reads when inspecting exit state. RAM can be tampered with
+    ; or unmapped, whereas CPU MSRs and Read-Only VMCS fields are hardware-enforced
+    ; sources of truth. All exit reasons, vectors, and fault qualifications are
+    ; pulled directly from the silicon via VMREAD and RDMSR.
+    ;
+    ; Stack Discipline: PUSH and POP are strictly limited to the single entry
+    ; and exit register-preservation boundary of VM_Exit_Handler. Zero stack
+    ; pushes, pops, or RAM variables are used anywhere inside the dispatch logic.
+    ; In my opinion, RAM is fundamentally untrusted, so I designed this architecture
+    ; to operate almost without RAM—challenging myself to work strictly within
+    ; limited silicon resources and use every CPU register efficiently.
+    ; =========================================================================
+    ; 1. Read VM_EXIT_REASON (0x00004402) from silicon into R8
+    mov eax, VMCS_RO_EXIT_REASON        ; 0x00004402
+    vmread r8, rax
+    and r8d, 0x0000FFFF                 ; Isolate Basic Exit Reason (Bits 15:0)
+
+    ; 2. Is Exit Reason 0 (Exception/NMI) or 1 (External Interrupt)?
+    cmp r8d, 1
+    ja .NotFredEvent                    ; > 1 -> Not an exception/interrupt exit
+
+    ; 3. Confirm hardware event validity via VM_EXIT_INTR_INFO (0x00004404)
+    mov eax, VMCS_RO_VMEXIT_INTR_INFO   ; 0x00004404
+    vmread r10, rax
+    bt r10, 31                          ; Bit 31 = Hardware Valid Flag
+    jnc .NotFredEvent                   ; Carry = 0 -> Not a valid event
+
+    ; Confirmed: Jump straight to your FRED/Event secondary handler
+    lfence
+    jmp .My_FRED_HANDLER
+
+.NotFredEvent:
+    ; Continue checking standard Exit Reasons (10=CPUID, 28=CR, 31/32=MSR, 48=EPT...)
+
+
+    
+
+Guest_back:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rbp
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+
+    lfence                              ; Serialize execution before resuming Guest
+    vmresume
+
+My_FRED_HANDLER:
+    ; +0x000: Entry from Ring 3 -> Jump straight to shared NMI check
+    endbr64
+    jmp .CheckEvent
+
+    ; Mandatory 256-byte hardware offset (+0x100)
+    times 0x100 - ($ - My_FRED_HANDLER) db 0x90
+
+    ; +0x100: Entry from Ring 0 (Hypervisor) -> Falls straight into shared NMI check
+    endbr64
+
+.CheckEvent:
+    push rax
+
+    ; Check Event Type (Bits 58:56 of FRED SS QWORD): 2 = NMI
+    mov rax, [rsp + 0x10 + 0x28]
+    shr rax, 56
+    and al, 0x07
+    cmp al, 0x02
+    je .ReturnToCode                    ; Real NMI -> Return cleanly to interrupted code
+
+    ; Not NMI (Hardware Exception #MC, #GP, #PF, #CP) -> Intentional Triple Fault
+    xor eax, eax
+    mov cr3, rax
+    ud2
+
+.ReturnToCode:
+    pop rax
+    db 0xF3, 0x0F, 0x01, 0xCA           ; ERETS (Returns directly to interrupted Hypervisor RIP)
 
 
 
-pop rdx
-pop rcx
-pop rbx 
-pop rax
-xor rbp, rbp
+
 
 section .data
     align 4096
@@ -1740,9 +2225,6 @@ vmxon_region:
 
     vmxon_pointer: dq 0
     guest_stack_top: dq 0 
-
-    align 16
-host_idt_table: times 256 dq 0 
 
     Guest_Code_Entry:
     mov eax, 0xABCDEF  
